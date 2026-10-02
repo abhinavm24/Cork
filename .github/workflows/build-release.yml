@@ -1,0 +1,168 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-release.yml"
+      - ".mise.toml"
+      - "**/*.swift"
+      - "Tuist/**"
+      - "xcconfigs/**"
+      - "Cork/**"
+      - "Modules/**"
+      - "PrivacyInfo.xcprivacy"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Apple Silicon self-compiled app
+    runs-on: macos-latest
+    timeout-minutes: 60
+    outputs:
+      release_tag: ${{ steps.package.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+
+      - name: Identify Xcode
+        id: xcode
+        run: |
+          xcodebuild -version
+          xcode_version=$(xcodebuild -version | tr '[:space:]' '-')
+          echo "version=$xcode_version" >> "$GITHUB_OUTPUT"
+
+      - name: Restore dependencies and compiler output
+        # Cache expiry is controlled by repository Actions settings, not this action.
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            Tuist/.build
+            ${{ runner.temp }}/DerivedData
+          key: cork-${{ runner.os }}-${{ steps.xcode.outputs.version }}-arm64-${{ hashFiles('.mise.toml', 'Tuist/Package.swift', 'Tuist/Package.resolved', 'Tuist.swift', 'Project.swift', 'xcconfigs/*.xcconfig') }}
+
+      - name: Install dependencies and generate workspace
+        run: |
+          tuist install
+          tuist generate --no-open --no-binary-cache
+
+      - name: Archive Self-Compiled
+        id: archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -workspace Cork.xcworkspace \
+            -scheme Self-Compiled \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Cork.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM= \
+            | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Save dependencies and compiler output
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' && steps.cache.outputs.cache-primary-key != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            Tuist/.build
+            ${{ runner.temp }}/DerivedData
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Verify and package app
+        id: package
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/Cork.xcarchive/Products/Applications/Cork.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          architectures=$(lipo -archs "$app/Contents/MacOS/$executable")
+          echo "Executable architectures: $architectures"
+          [[ "$architectures" == arm64 ]] || { echo "Expected arm64 only; got: $architectures"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          signature=$(codesign --display --verbose=2 "$app" 2>&1)
+          echo "$signature"
+          [[ "$signature" == *"Signature=adhoc"* ]] || { echo 'Expected an ad-hoc signature'; exit 1; }
+          app_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          version="v${app_version}-selfcompiled.${GITHUB_RUN_NUMBER}"
+          echo "release_tag=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/Cork-${version}-macos-arm64.zip"
+          (cd dist && shasum -a 256 ./*.zip > SHA256SUMS.txt)
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: cork-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 90
+
+  release:
+    name: Publish GitHub Release
+    if: github.repository == 'abhinavm24/Cork' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cork-macos-arm64
+          path: dist
+
+      - name: Publish app and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          if tag_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha' 2>/dev/null); then
+            [[ "$tag_sha" == "$GITHUB_SHA" ]] || { echo 'Release tag points to a different commit'; exit 1; }
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$GITHUB_SHA"
+          fi
+          printf '%s\n' \
+            'Self-compiled Cork build for Apple Silicon Macs (arm64).' \
+            '' \
+            'Download the ZIP, extract it, and move Cork.app to Applications.' \
+            'This build uses the Self-Compiled scheme and requires no Cork license.' \
+            'The app is ad-hoc signed and is not notarized by Apple; macOS may require approval in System Settings > Privacy & Security before opening it.' \
+            '' \
+            "Source commit: $GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/*.zip dist/SHA256SUMS.txt \
+              --verify-tag \
+              --title "Cork $RELEASE_TAG (Self-Compiled)" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
